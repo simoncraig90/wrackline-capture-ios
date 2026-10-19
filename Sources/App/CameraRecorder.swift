@@ -16,6 +16,12 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
     var live: LiveStats { statLock.lock(); defer { statLock.unlock() }; return _live }
 
     private let q = DispatchQueue(label: "wrk.capture", qos: .userInteractive)
+    /// Session configuration + startRunning/stopRunning live here, NEVER on `q` and never under TakeManager's lock: both calls randomly take 9 s on the SE
+    /// (TICKET-133), and on `q` that gapped the frames. A /start arriving during a slow stopRunning queues behind it on this serial queue.
+    private let sessionQ = DispatchQueue(label: "wrk.capture.session", qos: .userInitiated)
+    /// Alerts raised from sessionQ go through here: TakeManager's lock may be held by a caller that is itself waiting on sessionQ, so sessionQ must never take it.
+    private let alertQ = DispatchQueue(label: "wrk.capture.alerts")
+    private func report(_ msg: String) { alertQ.async { [weak self] in self?.events?.recorderError(msg) } }
     private let statLock = NSLock()
     private var _live = LiveStats()
     private func updateLive(_ f: (inout LiveStats) -> Void) { statLock.lock(); f(&_live); statLock.unlock() }
@@ -64,7 +70,7 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
     /// TICKET-133 diagnosis: some /start and /stop calls stall ~9 s on the SE. Every start/stop step reports itself when it takes > 0.5 s.
     @discardableResult private func timed<T>(_ step: String, _ f: () throws -> T) rethrows -> T {
         let t0 = CACurrentMediaTime()
-        defer { let d = CACurrentMediaTime() - t0; if d > 0.5 { events?.recorderError("slow step \(step): \(String(format: "%.1f", d)) s") } }
+        defer { let d = CACurrentMediaTime() - t0; if d > 0.5 { report("slow step \(step): \(String(format: "%.1f", d)) s") } }
         return try f()
     }
 
@@ -72,17 +78,21 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { throw CameraError.denied("camera (Settings > Capture > Camera)") }
         var failure: Error?
         let t0 = CACurrentMediaTime()
-        q.sync {
+        // returns once the configuration is committed; startRunning is dispatched (async) at the end of configureAndRun
+        sessionQ.sync {
             let waited = CACurrentMediaTime() - t0
-            if waited > 0.5 { self.events?.recorderError("slow step start: waiting for queue q: \(String(format: "%.1f", waited)) s") }
+            if waited > 0.5 { self.report("slow step start: waiting for session queue (previous stopRunning in flight): \(String(format: "%.1f", waited)) s") }
             do { try self.timed("start total") { try self.configureAndRun(dir: dir, config: config, nameSuffix: nameSuffix) } } catch { failure = error }
         }
         if let failure { throw failure }
     }
 
     private func configureAndRun(dir: URL, config: Config, nameSuffix: String) throws {
-        self.dir = dir; cfg = config; suffix = nameSuffix; torchMode = config.string("torch")
-        gotFirstFrame = false; writer = nil; chunkName = ""; frameCount = 0; lockedAF = false; darkSince = 0; fpsWindowStart = .invalid; fpsWindowFrames = 0; frameDuration = .invalid
+        // q-owned state is reset on q (short; q is never blocked by session calls). No frames arrive yet: the previous session is stopped and this one not started.
+        q.sync {
+            self.dir = dir; cfg = config; suffix = nameSuffix; torchMode = config.string("torch")
+            gotFirstFrame = false; writer = nil; chunkName = ""; frameCount = 0; lockedAF = false; darkSince = 0; fpsWindowStart = .invalid; fpsWindowFrames = 0; frameDuration = .invalid
+        }
         updateLive { $0 = LiveStats() }
 
         guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { throw CameraError.noDevice("back camera") }
@@ -111,8 +121,8 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
                 timed("audio setActive") { try? AVAudioSession.sharedInstance().setActive(true) }
                 let aout = AVCaptureAudioDataOutput()
                 aout.setSampleBufferDelegate(self, queue: q)
-                if s.canAddInput(ain), s.canAddOutput(aout) { s.addInput(ain); s.addOutput(aout) } else { events?.recorderError("audio unavailable: cannot add") }
-            } else { events?.recorderError("audio unavailable: microphone permission or device missing") }
+                if s.canAddInput(ain), s.canAddOutput(aout) { s.addInput(ain); s.addOutput(aout) } else { report("audio unavailable: cannot add") }
+            } else { report("audio unavailable: microphone permission or device missing") }
         }
 
         // format + frame durations INSIDE begin/commitConfiguration (Apple's documented order), so startRunning does not reset them
@@ -146,11 +156,16 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
 
         session = s
         running = true
-        timed("startRunning") { s.startRunning() }
-        timed("reassert after start") { reassertFrameDuration(reason: "after startRunning") }
-        let lockMs = max(200, min(cfg.int("lockAfterMs"), 4000))
-        q.asyncAfter(deadline: .now() + .milliseconds(lockMs)) { [weak self] in self?.lockFocusAndWB(retries: 6) }
         updateLive { $0.shutter = "1/\(Int((1.0 / dur).rounded()))" }
+        // startRunning can take 9 s: dispatched, not awaited. The writer opens its chunk on the first sample buffer, so a slow start only makes frames late.
+        let lockMs = max(200, min(cfg.int("lockAfterMs"), 4000))
+        sessionQ.async { [weak self] in
+            guard let self else { return }
+            guard self.session === s else { return }   // /stop already ran for this session
+            self.timed("startRunning") { s.startRunning() }
+            self.timed("reassert after start") { self.reassertFrameDuration(reason: "after startRunning") }
+            self.q.asyncAfter(deadline: .now() + .milliseconds(lockMs)) { [weak self] in self?.lockFocusAndWB(retries: 6) }
+        }
     }
 
     /// Re-set min/max frame duration (lock, set, unlock). Called once after startRunning and again at the focus lock; reports if the device had moved off the target.
@@ -205,11 +220,15 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
         guard running else { return }
         running = false
         timed("stop torch off") { setTorchRaw(false, reason: "stopped") }
-        timed("stopRunning") { session?.stopRunning() }
+        // running=false makes the sample callbacks ignore frames; close the chunk on q first (0.3 s), then stop the session off every lock and queue that matters
         timed("stop finishChunk on q") { q.sync { self.finishChunk() } }
         timed("stop finishWriting wait") { _ = finishGroup.wait(timeout: .now() + 20) }
+        let s = session
         session = nil; device = nil
-        timed("audio deactivate") { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
+        sessionQ.async { [weak self] in
+            self?.timed("stopRunning") { s?.stopRunning() }
+            self?.timed("audio deactivate") { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
+        }
     }
 
     // MARK: sample buffers (q)
