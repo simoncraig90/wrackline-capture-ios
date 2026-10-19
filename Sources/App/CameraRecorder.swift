@@ -130,8 +130,8 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
         if let conn = vout.connection(with: .video), conn.isVideoStabilizationSupported { conn.preferredVideoStabilizationMode = .off }
         timed("commitConfiguration") { s.commitConfiguration() }
 
+        // unlocked again BEFORE startRunning: holding the device lock across startRunning stalled it 9.0 s on ~1 start in 3 (SE, 19 Oct)
         try timed("device lock 2") { try dev.lockForConfiguration() }
-        defer { dev.unlockForConfiguration() }
 
         // exposure: fixed shutter (clamped to the frame time), ISO driven by the metering loop below
         let want = cfg.shutterSeconds
@@ -142,6 +142,7 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
         if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
         if dev.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { dev.whiteBalanceMode = .continuousAutoWhiteBalance }
         dev.isSubjectAreaChangeMonitoringEnabled = false
+        dev.unlockForConfiguration()
 
         session = s
         running = true
