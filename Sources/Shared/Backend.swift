@@ -23,7 +23,8 @@ public struct DeviceInfo {
 public protocol RecorderEvents: AnyObject {
     func firstFrame(wallMs: Int64)
     func chunkOpened(name: String, wallMs: Int64)
-    func chunkClosed(name: String, frames: Int, durMs: Int)
+    /// frames = video frames actually appended to the writer; writtenFps = those frames over the chunk's PTS span (0 when under 2 frames).
+    func chunkClosed(name: String, frames: Int, durMs: Int, writtenFps: Double)
     func recorderError(_ msg: String)
 }
 

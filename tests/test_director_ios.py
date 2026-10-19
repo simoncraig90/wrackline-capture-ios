@@ -110,6 +110,24 @@ try:
         ds = call(PF + 1, f'/status.json?t={TOK}')
         check('denied permission: no take was started', ds.get('recording') is False and ds.get('take') == '', ds)
     finally: den.terminate(); den.wait()
+    # --- truth check (slow first take): healthy fake = 120 frames/2000 ms -> writtenFps 60, no alert; short fake = 33 frames/2000 ms -> 16.5 fps -> "fps short" alert
+    check('healthy take: sidecar chunk has writtenFrames 120 / writtenFps 60, no fps alert', sc2['chunks'][0].get('writtenFrames') == 120 and sc2['chunks'][0].get('writtenFps') == 60.0
+          and not any('fps short' in a for a in st2.get('alerts', [])) and st2.get('writtenFrames') == 120, (sc2, st2))
+    shortp = subprocess.Popen([FAKE, '--port', str(PF + 2), '--token', TOK, '--dir', os.path.join(tmp, 'device-short'), '--sample', sample, '--frames', '33', '--dur-ms', '2000'])
+    try:
+        for _ in range(50):
+            try: call(PF + 2, f'/time?t={TOK}'); break
+            except Exception: time.sleep(0.1)
+        call(PF + 2, f'/start?t={TOK}&label=short', 'POST'); time.sleep(0.5)
+        call(PF + 2, f'/stop?t={TOK}', 'POST')
+        ss = call(PF + 2, f'/status.json?t={TOK}')
+        stid = ss.get('take', '')
+        ssc = json.loads(urllib.request.urlopen(f'http://127.0.0.1:{PF + 2}/chunk/{stid}.json?t={TOK}').read()) if stid else {}
+        ch0 = (ssc.get('chunks') or [{}])[0]
+        check('short take (16.5 fps): alert "fps short: 16.5 of 60" in /status.json, warning, writtenFps in status + sidecar',
+              'fps short: 16.5 of 60' in ss.get('alerts', []) and 'fps' in ss.get('warnings', {}) and ss.get('writtenFps') == 16.5 and ss.get('writtenFrames') == 33
+              and ch0.get('writtenFps') == 16.5 and ch0.get('writtenFrames') == 33 and ch0.get('fpsShort') is True, (ss, ssc))
+    finally: shortp.terminate(); shortp.wait()
 finally:
     dirc.terminate(); fake.terminate(); dirc.wait(); fake.wait()
 print('RESULT', 'RED: ' + ', '.join(fails) if fails else 'GREEN'); sys.exit(1 if fails else 0)

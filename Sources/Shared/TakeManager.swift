@@ -25,6 +25,7 @@ public final class TakeManager: RecorderEvents {
     private var currentChunk = ""
     public var warnings: [String: String] = [:]
     public var alertLog: [String] = []
+    private var lastWrittenFrames = 0, lastWrittenFps = 0.0
 
     public init(dir: URL, token: String, backend: RecorderBackend, deviceName: String, device: @escaping () -> DeviceInfo) {
         self.dir = dir; self.token = token; self.backend = backend; self.deviceName = deviceName; self.device = device
@@ -74,7 +75,7 @@ public final class TakeManager: RecorderEvents {
         sidecar = ["take": takeId, "label": label, "session": session, "camera": camera, "device": deviceName, "marker": mark,
                    "markers": [Any](), "chunks": [Any](), "shutter": cfg.shutterText, "fps": cfg.fps, "chunkSeconds": cfg.chunkSeconds, "platform": "ios"]
         writeSidecar()
-        chunksDone = 0; currentChunk = ""; openChunks = []; warnings = [:]
+        chunksDone = 0; currentChunk = ""; openChunks = []; warnings = [:]; lastWrittenFrames = 0; lastWrittenFps = 0
         do { try backend.start(dir: dir, config: cfg, nameSuffix: slug.isEmpty ? "" : "_" + slug) }
         catch {
             sidecar["stop"] = ["mono_ns": monoNowNs(), "wall_ms": wallNowMs(), "why": "start failed: \(error)"]; writeSidecar()
@@ -119,10 +120,19 @@ public final class TakeManager: RecorderEvents {
         a.append(["name": name, "wall_ms": wallMs, "open": true]); sidecar["chunks"] = a
         openChunks.insert(name); currentChunk = name; writeSidecar()
     }
-    public func chunkClosed(name: String, frames: Int, durMs: Int) {
+    public func chunkClosed(name: String, frames: Int, durMs: Int, writtenFps: Double) {
         lock.lock(); defer { lock.unlock() }
         var a = (sidecar["chunks"] as? [[String: Any]]) ?? []
-        for i in a.indices where (a[i]["name"] as? String) == name { a[i]["open"] = false; a[i]["frames"] = frames; a[i]["dur_ms"] = durMs }
+        let wf = (writtenFps * 10).rounded() / 10
+        // truth check (TICKET-133 slow first take): the file's real rate, not the live estimate. Needs >= 2 s of footage to mean anything.
+        let want = (sidecar["fps"] as? Int) ?? config.fps
+        let short = frames >= 2 && durMs >= 2000 && writtenFps < 0.95 * Double(want)
+        for i in a.indices where (a[i]["name"] as? String) == name {
+            a[i]["open"] = false; a[i]["frames"] = frames; a[i]["dur_ms"] = durMs; a[i]["writtenFrames"] = frames; a[i]["writtenFps"] = wf
+            if short { a[i]["fpsShort"] = true }
+        }
+        lastWrittenFrames = frames; lastWrittenFps = wf
+        if short { let msg = "fps short: \(wf) of \(want)"; warnings["fps"] = msg; alertLog.append(msg) }
         sidecar["chunks"] = a; openChunks.remove(name); chunksDone += 1; writeSidecar()
     }
     public func recorderError(_ msg: String) {
@@ -156,6 +166,7 @@ public final class TakeManager: RecorderEvents {
             "recSeconds": rec, "interrupted": interrupted, "interruptedWhy": interruptedWhy, "chunk": currentChunk, "chunksDone": chunksDone,
             "battery": d.battery, "plugged": d.plugged, "tempC": d.tempC, "remainingMin": -1,
             "mode": "ios \(cfg.width)x\(cfg.height)", "fps": cfg.fps, "measuredFps": l.measuredFps,
+            "writtenFrames": lastWrittenFrames, "writtenFps": lastWrittenFps,
             "cameraDrops": l.camDrops, "encoderDrops": l.encDrops, "expNs": l.expNs,
             "iso": l.iso, "shutter": l.shutter.isEmpty ? cfg.shutterText : l.shutter, "exposureUs": l.expNs / 1000, "shortened": false,
             "luma": (l.luma * 1000).rounded() / 1000, "flicker": (l.flicker * 1000).rounded() / 1000,

@@ -27,7 +27,7 @@ final class FakeRecorder: RecorderBackend {
         let name = isoName(first) + suffix + ".mp4"
         try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
         try? FileManager.default.copyItem(at: sample, to: dir.appendingPathComponent(name))
-        events?.chunkClosed(name: name, frames: frames, durMs: durMs)
+        events?.chunkClosed(name: name, frames: frames, durMs: durMs, writtenFps: Double(frames) / (Double(durMs) / 1000))
     }
     func setTorch(_ mode: String) { torch = mode }
     func previewJPEG() -> Data? { Data([0xFF, 0xD8, 0xFF, 0xD9]) }

@@ -47,6 +47,7 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
     private var fpsWindowStart = CMTime.invalid
     private var fpsWindowFrames = 0
     private var torchMode = "auto"
+    private var frameDuration = CMTime.invalid
 
     // preview
     private var previewUntil: CFAbsoluteTime = 0
@@ -71,13 +72,15 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
 
     private func configureAndRun(dir: URL, config: Config, nameSuffix: String) throws {
         self.dir = dir; cfg = config; suffix = nameSuffix; torchMode = config.string("torch")
-        gotFirstFrame = false; writer = nil; chunkName = ""; frameCount = 0; lockedAF = false; darkSince = 0; fpsWindowStart = .invalid; fpsWindowFrames = 0
+        gotFirstFrame = false; writer = nil; chunkName = ""; frameCount = 0; lockedAF = false; darkSince = 0; fpsWindowStart = .invalid; fpsWindowFrames = 0; frameDuration = .invalid
         updateLive { $0 = LiveStats() }
 
         guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { throw CameraError.noDevice("back camera") }
         device = dev
         let s = AVCaptureSession()
         s.beginConfiguration()
+        // inputPriority: the session must not pick its own preset/format/frame rate over ours (a preset can silently reset activeFormat + durations)
+        s.sessionPreset = .inputPriority
         let vin = try AVCaptureDeviceInput(device: dev)
         guard s.canAddInput(vin) else { throw CameraError.config("cannot add camera input") }
         s.addInput(vin)
@@ -101,15 +104,24 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
                 if s.canAddInput(ain), s.canAddOutput(aout) { s.addInput(ain); s.addOutput(aout) } else { events?.recorderError("audio unavailable: cannot add") }
             } else { events?.recorderError("audio unavailable: microphone permission or device missing") }
         }
+
+        // format + frame durations INSIDE begin/commitConfiguration (Apple's documented order), so startRunning does not reset them
+        let fd = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
+        frameDuration = fd
+        try dev.lockForConfiguration()
+        do {
+            try selectFormat(dev)
+            dev.activeVideoMinFrameDuration = fd; dev.activeVideoMaxFrameDuration = fd
+            if dev.activeFormat.isVideoHDRSupported { dev.automaticallyAdjustsVideoHDREnabled = false; dev.isVideoHDREnabled = false }
+            // low-light boost lowers the frame rate in dim rooms (the 16.5 fps indoor take)
+            if dev.isLowLightBoostSupported { dev.automaticallyEnablesLowLightBoostWhenAvailable = false }
+        } catch { dev.unlockForConfiguration(); throw error }
+        dev.unlockForConfiguration()
+        if let conn = vout.connection(with: .video), conn.isVideoStabilizationSupported { conn.preferredVideoStabilizationMode = .off }
         s.commitConfiguration()
 
         try dev.lockForConfiguration()
         defer { dev.unlockForConfiguration() }
-        try selectFormat(dev)
-        let fd = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
-        dev.activeVideoMinFrameDuration = fd; dev.activeVideoMaxFrameDuration = fd
-        if dev.activeFormat.isVideoHDRSupported { dev.automaticallyAdjustsVideoHDREnabled = false; dev.isVideoHDREnabled = false }
-        if let conn = vout.connection(with: .video), conn.isVideoStabilizationSupported { conn.preferredVideoStabilizationMode = .off }
 
         // exposure: fixed shutter (clamped to the frame time), ISO driven by the metering loop below
         let want = cfg.shutterSeconds
@@ -124,9 +136,23 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
         session = s
         running = true
         s.startRunning()
+        reassertFrameDuration(reason: "after startRunning")
         let lockMs = max(200, min(cfg.int("lockAfterMs"), 4000))
         q.asyncAfter(deadline: .now() + .milliseconds(lockMs)) { [weak self] in self?.lockFocusAndWB(retries: 6) }
         updateLive { $0.shutter = "1/\(Int((1.0 / dur).rounded()))" }
+    }
+
+    /// Re-set min/max frame duration (lock, set, unlock). Called once after startRunning and again at the focus lock; reports if the device had moved off the target.
+    private func reassertFrameDuration(reason: String) {
+        guard let dev = device, frameDuration.isValid else { return }
+        let fd = frameDuration
+        let off = CMTimeCompare(dev.activeVideoMinFrameDuration, fd) != 0 || CMTimeCompare(dev.activeVideoMaxFrameDuration, fd) != 0
+        do {
+            try dev.lockForConfiguration()
+            dev.activeVideoMinFrameDuration = fd; dev.activeVideoMaxFrameDuration = fd
+            dev.unlockForConfiguration()
+            if off { events?.recorderError("frame duration was reset (\(reason)); re-set to 1/\(cfg.fps)") }
+        } catch { events?.recorderError("frame duration re-set failed (\(reason)): \(error)") }
     }
 
     private func selectFormat(_ dev: AVCaptureDevice) throws {
@@ -149,6 +175,7 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
 
     private func lockFocusAndWB(retries: Int) {
         guard running, !lockedAF, let dev = device else { return }
+        if retries == 6 { reassertFrameDuration(reason: "at focus lock") }
         if dev.isAdjustingFocus && retries > 0 { q.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in self?.lockFocusAndWB(retries: retries - 1) }; return }
         do {
             try dev.lockForConfiguration(); defer { dev.unlockForConfiguration() }
@@ -196,10 +223,9 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
         if writer != nil, CMTimeGetSeconds(CMTimeSubtract(pts, chunkFirstPTS)) >= Double(cfg.chunkSeconds) { finishChunk() }
         if writer == nil { openChunk(first: sb, pts: pts) }
         if let w = writer, w.status == .writing, let vIn {
-            if vIn.isReadyForMoreMediaData, vIn.append(sb) { chunkFrames += 1; chunkLastPTS = pts } else { updateLive { $0.encDrops += 1 } }
+            if vIn.isReadyForMoreMediaData, vIn.append(sb) { chunkFrames += 1; chunkLastPTS = pts; measureFps(pts) } else { updateLive { $0.encDrops += 1 } }
         } else if let w = writer, w.status == .failed { events?.recorderError("writer failed: \(w.error?.localizedDescription ?? "?")") }
         frameCount += 1
-        measureFps(pts)
         if frameCount % 6 == 0, let px = CMSampleBufferGetImageBuffer(sb) { meter(px) }
         let now = CFAbsoluteTimeGetCurrent()
         if now < previewUntil, now - lastPreview > 0.5, let px = CMSampleBufferGetImageBuffer(sb) { lastPreview = now; makePreview(px) }
@@ -250,13 +276,16 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
     private func finishChunk() {
         guard let w = writer else { return }
         let name = chunkName, frames = chunkFrames
+        // truth check: frames actually appended over their PTS span (n frames span n-1 intervals)
+        let spanS = CMTimeGetSeconds(CMTimeSubtract(chunkLastPTS, chunkFirstPTS))
+        let writtenFps = frames >= 2 && spanS > 0 ? Double(frames - 1) / spanS : 0
         let fdur = 1.0 / Double(max(1, cfg.fps))
         let durMs = Int(((CMTimeGetSeconds(CMTimeSubtract(chunkLastPTS, chunkFirstPTS)) + fdur) * 1000).rounded())
         vIn?.markAsFinished(); aIn?.markAsFinished()
         writer = nil; vIn = nil; aIn = nil
         finishGroup.enter()
         w.finishWriting { [weak self] in
-            if w.status == .completed { self?.events?.chunkClosed(name: name, frames: frames, durMs: durMs) }
+            if w.status == .completed { self?.events?.chunkClosed(name: name, frames: frames, durMs: durMs, writtenFps: writtenFps) }
             else { self?.events?.recorderError("chunk \(name) failed: \(w.error?.localizedDescription ?? "?")") }
             self?.finishGroup.leave()
         }
