@@ -1,0 +1,23 @@
+name: build-ipa
+on: [push, workflow_dispatch]
+jobs:
+  ipa:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install xcodegen
+      - run: xcodegen generate
+      - name: Build unsigned (TrollStore signs on install)
+        run: |
+          xcodebuild -project WracklineCapture.xcodeproj -scheme Capture -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build | tail -40
+          test -d build/Build/Products/Release-iphoneos/Capture.app
+      - name: Package IPA
+        run: |
+          mkdir Payload && cp -R build/Build/Products/Release-iphoneos/Capture.app Payload/
+          zip -qr WracklineCapture.ipa Payload && ls -l WracklineCapture.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WracklineCapture-ipa
+          path: WracklineCapture.ipa
