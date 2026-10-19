@@ -285,9 +285,11 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
         writer = nil; vIn = nil; aIn = nil
         finishGroup.enter()
         w.finishWriting { [weak self] in
+            // leave BEFORE reporting: stop() waits on finishGroup while TakeManager.stopRecording holds its lock, and the events below
+            // take that lock, so reporting first stalled every /stop for the full 20 s wait timeout (measured 20.3 s on the SE, 19 Oct)
+            self?.finishGroup.leave()
             if w.status == .completed { self?.events?.chunkClosed(name: name, frames: frames, durMs: durMs, writtenFps: writtenFps) }
             else { self?.events?.recorderError("chunk \(name) failed: \(w.error?.localizedDescription ?? "?")") }
-            self?.finishGroup.leave()
         }
     }
 
