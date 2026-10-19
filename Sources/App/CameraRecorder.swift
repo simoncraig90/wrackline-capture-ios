@@ -61,11 +61,21 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
 
     // MARK: start / stop
 
+    /// TICKET-133 diagnosis: some /start and /stop calls stall ~9 s on the SE. Every start/stop step reports itself when it takes > 0.5 s.
+    @discardableResult private func timed<T>(_ step: String, _ f: () throws -> T) rethrows -> T {
+        let t0 = CACurrentMediaTime()
+        defer { let d = CACurrentMediaTime() - t0; if d > 0.5 { events?.recorderError("slow step \(step): \(String(format: "%.1f", d)) s") } }
+        return try f()
+    }
+
     func start(dir: URL, config: Config, nameSuffix: String) throws {
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { throw CameraError.denied("camera (Settings > Capture > Camera)") }
         var failure: Error?
+        let t0 = CACurrentMediaTime()
         q.sync {
-            do { try self.configureAndRun(dir: dir, config: config, nameSuffix: nameSuffix) } catch { failure = error }
+            let waited = CACurrentMediaTime() - t0
+            if waited > 0.5 { self.events?.recorderError("slow step start: waiting for queue q: \(String(format: "%.1f", waited)) s") }
+            do { try self.timed("start total") { try self.configureAndRun(dir: dir, config: config, nameSuffix: nameSuffix) } } catch { failure = error }
         }
         if let failure { throw failure }
     }
@@ -81,7 +91,7 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
         s.beginConfiguration()
         // inputPriority: the session must not pick its own preset/format/frame rate over ours (a preset can silently reset activeFormat + durations)
         s.sessionPreset = .inputPriority
-        let vin = try AVCaptureDeviceInput(device: dev)
+        let vin = try timed("video input") { try AVCaptureDeviceInput(device: dev) }
         guard s.canAddInput(vin) else { throw CameraError.config("cannot add camera input") }
         s.addInput(vin)
 
@@ -97,8 +107,8 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
                let ain = try? AVCaptureDeviceInput(device: mic) {
                 // record-only audio session: the app never plays a sound
                 s.automaticallyConfiguresApplicationAudioSession = false
-                try? AVAudioSession.sharedInstance().setCategory(.record, mode: .videoRecording, options: [])
-                try? AVAudioSession.sharedInstance().setActive(true)
+                timed("audio category") { try? AVAudioSession.sharedInstance().setCategory(.record, mode: .videoRecording, options: []) }
+                timed("audio setActive") { try? AVAudioSession.sharedInstance().setActive(true) }
                 let aout = AVCaptureAudioDataOutput()
                 aout.setSampleBufferDelegate(self, queue: q)
                 if s.canAddInput(ain), s.canAddOutput(aout) { s.addInput(ain); s.addOutput(aout) } else { events?.recorderError("audio unavailable: cannot add") }
@@ -108,7 +118,7 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
         // format + frame durations INSIDE begin/commitConfiguration (Apple's documented order), so startRunning does not reset them
         let fd = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
         frameDuration = fd
-        try dev.lockForConfiguration()
+        try timed("device lock 1") { try dev.lockForConfiguration() }
         do {
             try selectFormat(dev)
             dev.activeVideoMinFrameDuration = fd; dev.activeVideoMaxFrameDuration = fd
@@ -118,9 +128,9 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
         } catch { dev.unlockForConfiguration(); throw error }
         dev.unlockForConfiguration()
         if let conn = vout.connection(with: .video), conn.isVideoStabilizationSupported { conn.preferredVideoStabilizationMode = .off }
-        s.commitConfiguration()
+        timed("commitConfiguration") { s.commitConfiguration() }
 
-        try dev.lockForConfiguration()
+        try timed("device lock 2") { try dev.lockForConfiguration() }
         defer { dev.unlockForConfiguration() }
 
         // exposure: fixed shutter (clamped to the frame time), ISO driven by the metering loop below
@@ -135,8 +145,8 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
 
         session = s
         running = true
-        s.startRunning()
-        reassertFrameDuration(reason: "after startRunning")
+        timed("startRunning") { s.startRunning() }
+        timed("reassert after start") { reassertFrameDuration(reason: "after startRunning") }
         let lockMs = max(200, min(cfg.int("lockAfterMs"), 4000))
         q.asyncAfter(deadline: .now() + .milliseconds(lockMs)) { [weak self] in self?.lockFocusAndWB(retries: 6) }
         updateLive { $0.shutter = "1/\(Int((1.0 / dur).rounded()))" }
@@ -193,12 +203,12 @@ final class CameraRecorder: NSObject, RecorderBackend, AVCaptureVideoDataOutputS
     func stop() {
         guard running else { return }
         running = false
-        setTorchRaw(false, reason: "stopped")
-        session?.stopRunning()
-        q.sync { self.finishChunk() }
-        _ = finishGroup.wait(timeout: .now() + 20)
+        timed("stop torch off") { setTorchRaw(false, reason: "stopped") }
+        timed("stopRunning") { session?.stopRunning() }
+        timed("stop finishChunk on q") { q.sync { self.finishChunk() } }
+        timed("stop finishWriting wait") { _ = finishGroup.wait(timeout: .now() + 20) }
         session = nil; device = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        timed("audio deactivate") { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
     }
 
     // MARK: sample buffers (q)
