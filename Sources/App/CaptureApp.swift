@@ -68,7 +68,7 @@ final class AppModel: ObservableObject {
         guard take.recording else { recorder.cooldown(); return }
         var bg = UIBackgroundTaskIdentifier.invalid
         bg = UIApplication.shared.beginBackgroundTask(withName: "finish-chunk") { UIApplication.shared.endBackgroundTask(bg) }
-        DispatchQueue.global(qos: .userInitiated).async { [take] in
+        DispatchQueue.global(qos: .userInitiated).async { [take, recorder] in
             take.interruptRecording(why: "app left the foreground")
             recorder.cooldown()    // the warm session stops with the foreground; interruptRecording has already ended the take
             DispatchQueue.main.async { if bg != .invalid { UIApplication.shared.endBackgroundTask(bg) } }

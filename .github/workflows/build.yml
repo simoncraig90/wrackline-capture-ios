@@ -9,10 +9,11 @@ jobs:
       - run: xcodegen generate
       - name: Build unsigned (TrollStore signs on install)
         run: |
+          set -o pipefail
           xcodebuild -project WracklineCapture.xcodeproj -scheme Capture -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build | tail -40
-          test -d build/Build/Products/Release-iphoneos/Capture.app
+          test -f build/Build/Products/Release-iphoneos/Capture.app/Capture
       - name: Package IPA
         run: |
           mkdir Payload && cp -R build/Build/Products/Release-iphoneos/Capture.app Payload/
