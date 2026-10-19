@@ -10,7 +10,7 @@ public struct Config {
         "chunkSeconds": 300, "width": 1920, "height": 1080, "fps": 60, "bitrate": 8_000_000,
         "cameraId": "auto", "audio": true, "targetLuma": 0.42, "lockAfterMs": 1000, "darkSeconds": 3,
         "lowBattery": [20, 10], "stopBattery": 5, "tempWarnC": 42.0, "assumedDrainPctPerHour": 20.0,
-        "ntfyServer": "https://ntfy.sh", "ntfyTopic": "", "port": 8080, "darkLuma": 0.15, "torch": "auto", "sound": false, "rotate180": false,   // rotate180 is iOS-only: set true if the picture comes out upside down
+        "ntfyServer": "https://ntfy.sh", "ntfyTopic": "", "port": 8080, "darkLuma": 0.15, "warmIdleMinutes": 10, "torch": "auto", "sound": false, "rotate180": false,   // rotate180 is iOS-only: set true if the picture comes out upside down
     ]
 
     public init() { v = Config.defaults }

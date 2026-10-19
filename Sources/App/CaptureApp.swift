@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     @Published var warning = ""
 
     let take: TakeManager
+    private let recorder = CameraRecorder()
     private var server: HttpServer?
     private var timer: Timer?
 
@@ -21,7 +22,7 @@ final class AppModel: ObservableObject {
         var tok = (try? String(contentsOf: tokenFile))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if tok.isEmpty { tok = DeviceProbe.newToken(); try? tok.write(to: tokenFile, atomically: true, encoding: .utf8) }
         token = tok
-        take = TakeManager(dir: docs, token: tok, backend: CameraRecorder(), deviceName: "iPhone SE (2020)") { DeviceProbe.info() }
+        take = TakeManager(dir: docs, token: tok, backend: recorder, deviceName: "iPhone SE (2020)") { DeviceProbe.info() }
         take.listen = { [weak self] in self?.listenAddresses() ?? [] }
     }
 
@@ -38,6 +39,7 @@ final class AppModel: ObservableObject {
         for t in [AVMediaType.video, .audio] { g.enter(); AVCaptureDevice.requestAccess(for: t) { _ in g.leave() } }
         g.notify(queue: .main) { [weak self] in
             if let p = AppModel.permissionProblem(audio: true) { self?.warning = p }
+            self?.appActive()
         }
         let port = UInt16(take.config.port)
         let router = Router(take: take)
@@ -63,13 +65,20 @@ final class AppModel: ObservableObject {
     /// Inactive or background mid-take: finish the current chunk (mp4 closed, sidecar written), mark the take interrupted, do NOT resume.
     /// Runs off the main thread under a background task so iOS lets the writer finish.
     func appInactive() {
-        guard take.recording else { return }
+        guard take.recording else { recorder.cooldown(); return }
         var bg = UIBackgroundTaskIdentifier.invalid
         bg = UIApplication.shared.beginBackgroundTask(withName: "finish-chunk") { UIApplication.shared.endBackgroundTask(bg) }
         DispatchQueue.global(qos: .userInitiated).async { [take] in
             take.interruptRecording(why: "app left the foreground")
+            recorder.cooldown()    // the warm session stops with the foreground; interruptRecording has already ended the take
             DispatchQueue.main.async { if bg != .invalid { UIApplication.shared.endBackgroundTask(bg) } }
         }
+    }
+
+    /// Foreground again: bring the camera up now so the first /start finds it running (warm). Needs both permissions; otherwise /start's own check explains.
+    func appActive() {
+        guard AppModel.permissionProblem(audio: take.config.bool("audio")) == nil else { return }
+        recorder.warmUp(config: take.config)
     }
 
     private func refresh() {
@@ -117,6 +126,6 @@ struct CaptureApp: App {
         WindowGroup {
             ContentView(m: model).onAppear { model.start() }
         }
-        .onChange(of: phase) { p in if p != .active { model.appInactive() } }
+        .onChange(of: phase) { p in if p == .active { model.appActive() } else { model.appInactive() } }
     }
 }
